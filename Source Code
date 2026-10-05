@@ -1,0 +1,188 @@
+#include <ESP8266WiFi.h>
+#include <ESP8266HTTPClient.h>
+#include <WiFiClient.h>
+#include <SPI.h>
+#include <SD.h>
+#include <Wire.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_BME280.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <TinyGPS++.h>
+#include <SoftwareSerial.h>
+
+#define PIN_SD_CS      D8    // SD Card Chip Select (SPI)
+#define PIN_DS18B20    D3    // DS18B20 OneWire Data Pin
+#define PIN_GPS_RX     D4    // Wemos D1 Mini RX (Connected to GPS TX)
+#define PIN_GPS_TX     D0    // Wemos D1 Mini TX (Connected to GPS RX)
+#define PIN_MOSFET_TRIG D5   // MOSFET Gate Trigger Switch
+#define PIN_LED_STATUS D6   // LED Status Indicator
+
+const char* WIFI_SSID     = "Brin-net";
+const char* WIFI_PASSWORD = "";
+const char* FIREBASE_URL  = "https://turtle-buoy-default-rtdb.firebaseio.com/telemetry.json";
+
+// Coordinates: Sungai Baturusa, Bangka Belitung (2°05'12.0"S 106°09'00.0"E)
+const double BATURUSA_LAT = -2.086667;
+const double BATURUSA_LON = 106.150000;
+
+Adafruit_BME280 bme;                     
+OneWire oneWire(PIN_DS18B20);
+DallasTemperature ds18b20(&oneWire);
+TinyGPSPlus gps;
+SoftwareSerial gpsSerial(PIN_GPS_RX, PIN_GPS_TX);
+
+unsigned long prevTime_Sensors   = 0;
+unsigned long prevTime_Telemetry = 0;
+unsigned long prevTime_SDLog     = 0;
+unsigned long prevTime_Blink     = 0;
+
+const unsigned long INTERVAL_SENSORS   = 2000;  // Baca sensor setiap 2 detik
+const unsigned long INTERVAL_TELEMETRY = 5000;  // Kirim data ke Cloud setiap 5 detik
+const unsigned long INTERVAL_SDLOG     = 10000; // Simpan ke SD Card setiap 10 detik
+const unsigned long INTERVAL_BLINK     = 500;   // Kedip LED indikator setiap 0.5 detik
+
+// Telemetry Global Variables
+double currentLat = BATURUSA_LAT;
+double currentLon = BATURUSA_LON;
+float  currentAirTemp = 0.0, currentPressure = 0.0, currentHumidity = 0.0;
+float  currentWaterTemp = 0.0;
+bool   sdCardActive = false;
+bool   ledState = LOW;
+
+void setup() {
+  Serial.begin(115200);
+  gpsSerial.begin(9600);
+
+  pinMode(PIN_MOSFET_TRIG, OUTPUT);
+  pinMode(PIN_LED_STATUS, OUTPUT);
+  digitalWrite(PIN_MOSFET_TRIG, HIGH); // Aktifkan Power Rail Sensor
+
+  Serial.println(F("\n=== TURTLE BUOY LAGRANGIAN DRIFTER FIRMWARE ==="));
+
+  // Initialize BME280 (Address 0x76)
+  if (!bme.begin(0x76)) {
+    Serial.println(F("[WARN] BME280 Not Detected at 0x76!"));
+  } else {
+    Serial.println(F("[OK] BME280 Sensor Initialized."));
+  }
+
+  // Initialize DS18B20 Water Temp Sensor
+  ds18b20.begin();
+  Serial.println(F("[OK] DS18B20 Water Temp Initialized."));
+
+  // Initialize SPI SD Card Reader
+  if (!SD.begin(PIN_SD_CS)) {
+    Serial.println(F("[WARN] SD Card Mounting Failed!"));
+    sdCardActive = false;
+  } else {
+    Serial.println(F("[OK] SD Card Mounted Successfully."));
+    sdCardActive = true;
+    
+    // Buat Header CSV jika file baru
+    if (!SD.exists("DRIFTLOG.CSV")) {
+      File logFile = SD.open("DRIFTLOG.CSV", FILE_WRITE);
+      if (logFile) {
+        logFile.println("Timestamp_ms,Latitude,Longitude,AirTemp_C,Pressure_hPa,Humidity_pct,WaterTemp_C");
+        logFile.close();
+      }
+    }
+  }
+
+  // WiFi Connection
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print(F("[INFO] Connecting to WiFi"));
+}
+
+// ========================================================
+// MAIN LOOP (100% NON-BLOCKING WITH MILLIS)
+// ========================================================
+void loop() {
+  unsigned long currentMillis = millis();
+
+  // Task 1: Continuous GPS Stream Processing
+  while (gpsSerial.available() > 0) {
+    gps.encode(gpsSerial.read());
+  }
+
+  // Task 2: Sensor Data Acquisition (Every 2 seconds)
+  if (currentMillis - prevTime_Sensors >= INTERVAL_SENSORS) {
+    prevTime_Sensors = currentMillis;
+
+    // Read BME280 Atmospheric Data
+    currentAirTemp  = bme.readTemperature();
+    currentPressure = bme.readPressure() / 100.0F;
+    currentHumidity = bme.readHumidity();
+
+    // Read DS18B20 Sea Water Temperature
+    ds18b20.requestTemperatures();
+    currentWaterTemp = ds18b20.getTempCByIndex(0);
+
+    // Read GPS Coordinates
+    if (gps.location.isValid()) {
+      currentLat = gps.location.lat();
+      currentLon = gps.location.lng();
+    } else {
+      // Fallback ke Sungai Baturusa, Bangka Belitung jika di dalam lab/ruangan
+      currentLat = BATURUSA_LAT;
+      currentLon = BATURUSA_LON;
+    }
+  }
+
+  // Task 3: Cloud Telemetry Dispatch (Every 5 seconds)
+  if (currentMillis - prevTime_Telemetry >= INTERVAL_TELEMETRY) {
+    prevTime_Telemetry = currentMillis;
+
+    if (WiFi.status() == WL_CONNECTED) {
+      WiFiClientSecure client;
+      client.setInsecure(); // Disable SSL validation for speed
+      HTTPClient http;
+
+      if (http.begin(client, FIREBASE_URL)) {
+        http.addHeader("Content-Type", "application/json");
+
+        String jsonPayload = "{";
+        jsonPayload += "\"lat\":" + String(currentLat, 6) + ",";
+        jsonPayload += "\"lon\":" + String(currentLon, 6) + ",";
+        jsonPayload += "\"air_temp\":" + String(currentAirTemp, 2) + ",";
+        jsonPayload += "\"pressure\":" + String(currentPressure, 2) + ",";
+        jsonPayload += "\"humidity\":" + String(currentHumidity, 2) + ",";
+        jsonPayload += "\"water_temp\":" + String(currentWaterTemp, 2) + ",";
+        jsonPayload += "\"uptime_ms\":" + String(currentMillis);
+        jsonPayload += "}";
+
+        int httpCode = http.POST(jsonPayload);
+        Serial.printf("[HTTP] Telemetry Sent. Code: %d\n", httpCode);
+        http.end();
+      }
+    }
+  }
+
+  // Task 4: SD Card CSV Logging (Every 10 seconds)
+  if (currentMillis - prevTime_SDLog >= INTERVAL_SDLOG) {
+    prevTime_SDLog = currentMillis;
+
+    if (sdCardActive) {
+      File logFile = SD.open("DRIFTLOG.CSV", FILE_WRITE);
+      if (logFile) {
+        logFile.print(currentMillis); logFile.print(",");
+        logFile.print(currentLat, 6); logFile.print(",");
+        logFile.print(currentLon, 6); logFile.print(",");
+        logFile.print(currentAirTemp, 2); logFile.print(",");
+        logFile.print(currentPressure, 2); logFile.print(",");
+        logFile.print(currentHumidity, 2); logFile.print(",");
+        logFile.println(currentWaterTemp, 2);
+        logFile.close();
+        Serial.println(F("[SD] Data logged to DRIFTLOG.CSV"));
+      }
+    }
+  }
+
+  // Task 5: Heartbeat LED Blink (Every 0.5 seconds)
+  if (currentMillis - prevTime_Blink >= INTERVAL_BLINK) {
+    prevTime_Blink = currentMillis;
+    ledState = !ledState;
+    digitalWrite(PIN_LED_STATUS, ledState);
+  }
+}
